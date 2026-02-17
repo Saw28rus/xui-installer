@@ -6,20 +6,18 @@
 
 ### Российский сервер (с geo-правилами)
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/3xui-secure-installer/main/install-xui-secure.sh) --server-type ru
+bash <(curl -fsSL https://raw.githubusercontent.com/Saw28rus/xui-installer/main/install-xui-secure.sh) --server-type ru
 ```
 
 ### Зарубежный сервер (стандартная установка)
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/3xui-secure-installer/main/install-xui-secure.sh) --server-type foreign
+bash <(curl -fsSL https://raw.githubusercontent.com/Saw28rus/xui-installer/main/install-xui-secure.sh) --server-type foreign
 ```
 
 ### Интерактивная установка (с выбором)
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/3xui-secure-installer/main/install-xui-secure.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Saw28rus/xui-installer/main/install-xui-secure.sh)
 ```
-
-> **Замените `YOUR_USERNAME`** на ваш GitHub username после создания репозитория.
 
 ## 📋 Что устанавливается
 
@@ -122,4 +120,3 @@ bash install-xui-secure.sh --uninstall
 ## 📝 Лицензия
 
 MIT License — свободное использование.
-
