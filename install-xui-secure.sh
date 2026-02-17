@@ -2,7 +2,7 @@
 #
 # install-xui-secure.sh — Автоматическая установка 3x-ui + Fail2ban + Geo-правила
 # Автор: VPN Admin Script
-# Версия: 3.0.0
+# Версия: 3.1.0
 # Совместимость: Ubuntu 22.04 / 24.04, Debian 11 / 12
 #
 # Использование:
@@ -13,11 +13,11 @@
 #   bash install-xui-secure.sh --uninstall                 # Удаление
 #
 
-set -euo pipefail
+set -uo pipefail
 IFS=$'\n\t'
 
 # ─── Константы ──────────────────────────────────────────────────────────────────
-readonly SCRIPT_VERSION="3.0.0"
+readonly SCRIPT_VERSION="3.1.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_FILE="/var/log/xui-install.log"
 readonly BACKUP_DIR="/root/.xui-install-backup"
@@ -88,7 +88,7 @@ show_banner() {
     cat << 'BANNER'
     ╔═══════════════════════════════════════════════════╗
     ║         3x-ui Panel + Server Protection           ║
-    ║         Automated Installer v3.0.0                ║
+    ║         Automated Installer v3.1.0                ║
     ╚═══════════════════════════════════════════════════╝
 BANNER
     echo -e "${DIM}    Версия: ${SCRIPT_VERSION}${NC}"
@@ -586,31 +586,51 @@ ask_custom_credentials() {
 
 # ─── Применение кастомных учётных данных ─────────────────────────────────────────
 apply_custom_credentials() {
-    if [[ -n "$CUSTOM_USERNAME" ]] && [[ -n "$CUSTOM_PASSWORD" ]]; then
-        step "Применение пользовательских учётных данных"
+    if [[ -z "$CUSTOM_USERNAME" ]] || [[ -z "$CUSTOM_PASSWORD" ]]; then
+        return 0
+    fi
 
-        # Используем встроенную команду 3x-ui
+    step "Применение пользовательских учётных данных"
+
+    # Останавливаем панель перед изменением данных
+    # Это гарантирует, что БД не заблокирована
+    systemctl stop x-ui >> "$LOG_FILE" 2>&1 || true
+    sleep 2
+
+    # Применяем кастомные учётные данные с повторными попытками
+    local retries=3
+    local success=false
+
+    while [[ $retries -gt 0 ]] && ! $success; do
         if "$XUI_BIN/x-ui" setting -username "$CUSTOM_USERNAME" -password "$CUSTOM_PASSWORD" >> "$LOG_FILE" 2>&1; then
-            PANEL_USERNAME="$CUSTOM_USERNAME"
-            PANEL_PASSWORD="$CUSTOM_PASSWORD"
-            log "INFO" "Логин и пароль успешно изменены"
-            info "Логин и пароль успешно изменены"
-
-            # Перезапускаем панель для применения
-            systemctl restart x-ui >> "$LOG_FILE" 2>&1
-            sleep 2
-
-            if systemctl is-active --quiet x-ui 2>/dev/null; then
-                info "Панель перезапущена с новыми данными"
-            else
-                warn "Панель не перезапустилась — попробуйте: systemctl restart x-ui"
-            fi
+            success=true
         else
-            warn "Не удалось изменить логин/пароль — используются случайные"
-            log "WARN" "Ошибка при изменении учётных данных"
-            PANEL_USERNAME=""
-            PANEL_PASSWORD=""
+            ((retries--))
+            sleep 2
         fi
+    done
+
+    if $success; then
+        PANEL_USERNAME="$CUSTOM_USERNAME"
+        PANEL_PASSWORD="$CUSTOM_PASSWORD"
+        log "INFO" "Логин и пароль успешно изменены на: $CUSTOM_USERNAME"
+        info "Логин изменён на: ${GREEN}${BOLD}${CUSTOM_USERNAME}${NC}"
+        info "Пароль изменён успешно"
+    else
+        warn "Не удалось изменить логин/пароль — используются случайные"
+        log "WARN" "Ошибка при изменении учётных данных после 3 попыток"
+        PANEL_USERNAME=""
+        PANEL_PASSWORD=""
+    fi
+
+    # Запускаем панель обратно
+    systemctl start x-ui >> "$LOG_FILE" 2>&1 || true
+    sleep 3
+
+    if systemctl is-active --quiet x-ui 2>/dev/null; then
+        info "Панель запущена с новыми данными"
+    else
+        warn "Панель не запустилась — попробуйте: systemctl restart x-ui"
     fi
 }
 
@@ -628,11 +648,18 @@ collect_panel_info() {
     fi
 
     # WebBasePath
-    PANEL_WEBBASEPATH=$(echo "$panel_output" | grep -oP 'webBasePath:\s*/?\K[^\s/]+' || true)
+    if [[ -z "$PANEL_WEBBASEPATH" ]]; then
+        PANEL_WEBBASEPATH=$(echo "$panel_output" | grep -oP 'webBasePath:\s*/?\K[^\s/]+' || true)
+    fi
+
+    # Если WebBasePath не получен из setting -show, ищем в логе
+    if [[ -z "$PANEL_WEBBASEPATH" ]]; then
+        PANEL_WEBBASEPATH=$(grep -oP 'WebBasePath:\s*\K\S+' "$LOG_FILE" 2>/dev/null | tail -1 || echo "")
+    fi
 
     # Если кастомные данные не были заданы — пытаемся получить из вывода установки
     if [[ -z "$PANEL_USERNAME" ]]; then
-        # Данные были случайными — ищем в логе
+        # Данные были случайными — ищем в логе установщика
         PANEL_USERNAME=$(grep -oP 'Username:\s*\K\S+' "$LOG_FILE" 2>/dev/null | tail -1 || echo "")
         PANEL_PASSWORD=$(grep -oP 'Password:\s*\K\S+' "$LOG_FILE" 2>/dev/null | tail -1 || echo "")
 
@@ -640,6 +667,11 @@ collect_panel_info() {
             PANEL_USERNAME="(см. вывод установки выше)"
             PANEL_PASSWORD="(см. вывод установки выше)"
         fi
+    fi
+
+    # Порт из лога если всё ещё пустой
+    if [[ -z "$PANEL_PORT" ]]; then
+        PANEL_PORT=$(grep -oP 'Port:\s*\K\d+' "$LOG_FILE" 2>/dev/null | tail -1 || echo "")
     fi
 
     info "Данные панели собраны"
@@ -685,21 +717,53 @@ install_xui() {
         return 0
     fi
 
-    # Перенаправляем вывод установки в лог и на экран одновременно
-    bash <(curl -Ls https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh) 2>&1 | tee -a "$LOG_FILE"
+    info "Запускаем установщик 3x-ui (следуйте инструкциям на экране)..."
+    echo ""
+    echo -e "  ${YELLOW}┌─────────────────────────────────────────────────────────┐${NC}"
+    echo -e "  ${YELLOW}│${NC}  ${BOLD}Установщик 3x-ui задаст вопросы:${NC}                       ${YELLOW}│${NC}"
+    echo -e "  ${YELLOW}│${NC}                                                         ${YELLOW}│${NC}"
+    echo -e "  ${YELLOW}│${NC}  • Customize Panel Port? → ${GREEN}n${NC} (Enter)                    ${YELLOW}│${NC}"
+    echo -e "  ${YELLOW}│${NC}  • SSL Certificate → выберите ${GREEN}2${NC} (IP) или ${GREEN}3${NC} (Custom)     ${YELLOW}│${NC}"
+    echo -e "  ${YELLOW}│${NC}                                                         ${YELLOW}│${NC}"
+    echo -e "  ${YELLOW}│${NC}  ${DIM}После установки скрипт автоматически применит${NC}          ${YELLOW}│${NC}"
+    echo -e "  ${YELLOW}│${NC}  ${DIM}ваш логин/пароль и настроит защиту.${NC}                    ${YELLOW}│${NC}"
+    echo -e "  ${YELLOW}└─────────────────────────────────────────────────────────┘${NC}"
+    echo ""
 
-    # Ожидание запуска сервиса
-    local retries=10
+    # Запускаем установщик 3x-ui (интерактивный)
+    # Используем подоболочку, чтобы set -e не прервал наш скрипт при ошибках установщика
+    (
+        set +e
+        bash <(curl -Ls https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh) 2>&1 | tee -a "$LOG_FILE"
+    )
+    local install_exit=$?
+
+    echo ""
+    step "Проверка установки 3x-ui"
+
+    # Ожидание запуска сервиса (даём время на миграцию БД и инициализацию)
+    local retries=15
     while [[ $retries -gt 0 ]]; do
         if systemctl is-active --quiet x-ui 2>/dev/null; then
-            info "3x-ui запущен"
+            sleep 3  # Дополнительное ожидание для завершения миграции БД
+            info "3x-ui запущен и готов к работе"
             return 0
         fi
         sleep 2
         ((retries--))
     done
 
-    die "3x-ui не запустился после установки"
+    # Если не запустился, пробуем запустить вручную
+    warn "3x-ui не запустился автоматически, пробуем запустить..."
+    systemctl start x-ui 2>/dev/null || true
+    sleep 3
+
+    if systemctl is-active --quiet x-ui 2>/dev/null; then
+        info "3x-ui запущен после ручного старта"
+        return 0
+    fi
+
+    die "3x-ui не запустился после установки. Проверьте: systemctl status x-ui"
 }
 
 # ─── Определение порта панели ────────────────────────────────────────────────────
@@ -932,11 +996,22 @@ install_fail2ban() {
 
     if $F2B_INSTALLED; then
         info "Fail2ban уже установлен — пропускаем установку"
-    else
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq > /dev/null 2>&1
-        apt-get install -y -qq fail2ban > /dev/null 2>&1
+        return 0
+    fi
+
+    export DEBIAN_FRONTEND=noninteractive
+    info "Обновляем список пакетов..."
+    apt-get update -qq >> "$LOG_FILE" 2>&1 || {
+        warn "Не удалось обновить список пакетов"
+    }
+    info "Устанавливаем fail2ban..."
+    if apt-get install -y -qq fail2ban >> "$LOG_FILE" 2>&1; then
         info "Fail2ban установлен"
+    else
+        error "Не удалось установить Fail2ban"
+        warn "Пропускаем настройку Fail2ban — установите вручную: apt install fail2ban"
+        SKIP_F2B=true
+        return 1
     fi
 }
 
@@ -945,6 +1020,12 @@ configure_fail2ban() {
     if $SKIP_F2B; then return 0; fi
 
     step "Настройка Fail2ban для защиты панели"
+
+    # Проверяем что fail2ban установлен
+    if ! command -v fail2ban-client &>/dev/null; then
+        warn "Fail2ban не найден — пропускаем настройку"
+        return 0
+    fi
 
     if $F2B_XUI_CONFIGURED; then
         create_backup
@@ -987,8 +1068,11 @@ EOF
     detail "Filter: $F2B_FILTER_DIR/x-ui.conf"
 
     # Перезапуск
-    systemctl restart fail2ban
-    systemctl enable fail2ban > /dev/null 2>&1
+    systemctl restart fail2ban 2>> "$LOG_FILE" || {
+        warn "Не удалось перезапустить Fail2ban"
+        return 0
+    }
+    systemctl enable fail2ban >> "$LOG_FILE" 2>&1 || true
 
     # Проверка
     local retries=5
@@ -1001,7 +1085,7 @@ EOF
         ((retries--))
     done
 
-    die "Fail2ban не запустился"
+    warn "Fail2ban не запустился — проверьте: systemctl status fail2ban"
 }
 
 # ─── Удаление ────────────────────────────────────────────────────────────────────
@@ -1070,10 +1154,10 @@ show_summary() {
     fi
     echo -e "  ${CYAN}║${NC}                                                              ${CYAN}║${NC}"
 
-    if ! $SKIP_F2B; then
+    if ! $SKIP_F2B && command -v fail2ban-client &>/dev/null; then
         local banned_ssh banned_xui
-        banned_ssh=$(fail2ban-client status sshd 2>/dev/null | grep "Currently banned" | awk '{print $NF}' || echo "0")
-        banned_xui=$(fail2ban-client status x-ui 2>/dev/null | grep "Currently banned" | awk '{print $NF}' || echo "0")
+        banned_ssh=$(fail2ban-client status sshd 2>/dev/null | grep -oP 'Currently banned:\s*\K\d+' || echo "0")
+        banned_xui=$(fail2ban-client status x-ui 2>/dev/null | grep -oP 'Currently banned:\s*\K\d+' || echo "0")
 
         echo -e "  ${CYAN}║${NC}  ${BOLD}Fail2ban:${NC}                                                  ${CYAN}║${NC}"
         echo -e "  ${CYAN}║${NC}  SSH заблокировано:   ${banned_ssh} IP"
@@ -1107,8 +1191,8 @@ show_summary() {
 # ─── Главная функция ─────────────────────────────────────────────────────────────
 main() {
     # Инициализация лога
-    mkdir -p "$(dirname "$LOG_FILE")"
-    echo "=== Установка начата: $(date) ===" >> "$LOG_FILE"
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    echo "=== Установка начата: $(date) ===" >> "$LOG_FILE" 2>/dev/null || true
 
     parse_args "$@"
     show_banner
@@ -1138,14 +1222,14 @@ main() {
     # Создание бэкапа (если есть что бэкапить)
     create_backup
 
-    # Установка 3x-ui
+    # Установка 3x-ui (интерактивная — пользователь отвечает на вопросы)
     install_xui
 
-    # Применение кастомных учётных данных (после установки)
-    apply_custom_credentials
-
-    # Определение порта панели
+    # Определение порта панели (сразу после установки, до смены учётных данных)
     detect_panel_port
+
+    # Применение кастомных учётных данных (ПОСЛЕ полной установки и миграции БД)
+    apply_custom_credentials
 
     # Установка geo-файлов (только для RU)
     install_geo_rules
@@ -1155,8 +1239,9 @@ main() {
 
     # Перезапуск панели после изменений конфига
     if [[ "$SERVER_TYPE" == "ru" ]]; then
-        systemctl restart x-ui >> "$LOG_FILE" 2>&1
-        sleep 2
+        step "Перезапуск панели с новыми настройками"
+        systemctl restart x-ui >> "$LOG_FILE" 2>&1 || true
+        sleep 3
         if systemctl is-active --quiet x-ui 2>/dev/null; then
             info "Панель перезапущена с новыми настройками маршрутизации"
         else
@@ -1172,6 +1257,7 @@ main() {
     show_summary
 
     log "INFO" "Установка завершена успешно"
+    echo -e "  ${GREEN}${BOLD}Готово!${NC} Скрипт завершён.\n"
 }
 
 # ─── Запуск ──────────────────────────────────────────────────────────────────────
